@@ -3,83 +3,148 @@ $DarktraceIP  = "https://192.168.1.100" # Replace with your Darktrace IP/Hostnam
 $PublicToken  = "YOUR_PUBLIC_TOKEN"
 $PrivateToken = "YOUR_PRIVATE_TOKEN"
 $TempJsonFile = ".\temp_breaches.json"
-$OutputFile   = ".\Darktrace_ModelBreaches_Last3Months.csv"
+$OutputFile   = ".\Darktrace_ModelBreaches_Last1Month.csv"
+$ChunkDays    = 7 # Pull 7 days at a time to prevent API hangs
 
-# 1. Calculate Epoch Timestamps (in milliseconds) for the past 3 months
-$EpochStart     = Get-Date -Date "1970-01-01 00:00:00Z"
-$Now            = (Get-Date).ToUniversalTime()
-$ThreeMonthsAgo = $Now.AddMonths(-3)
+# Load .NET JSON serializer to bypass PowerShell 5.1's 4MB ConvertFrom-Json limit
+Add-Type -AssemblyName System.Web.Extensions
+$JsonSerializer = New-Object System.Web.Script.Serialization.JavaScriptSerializer
+$JsonSerializer.MaxJsonLength = [int]::MaxValue
 
-$StartTimeMs = [math]::Floor(($ThreeMonthsAgo - $EpochStart).TotalMilliseconds)
-$EndTimeMs   = [math]::Floor(($Now - $EpochStart).TotalMilliseconds)
+$EpochStart = Get-Date -Date "1970-01-01 00:00:00Z"
+$FinalEnd   = (Get-Date).ToUniversalTime()
+$ChunkStart = $FinalEnd.AddMonths(-1) # Set to 1 month as tested
 
-# 2. Build API Query and HMAC-SHA1 Signature
-$Endpoint   = "/modelbreaches?starttime=$StartTimeMs&endtime=$EndTimeMs"
-$DateHeader = $Now.ToString("yyyyMMddTHHmmss")
+$AllBreaches = New-Object System.Collections.Generic.List[PSObject]
 
-$StringToSign = "$Endpoint`n$PublicToken`n$DateHeader"
+# Define filterType names Darktrace uses for Destination Hostnames/Domains and Destination IPs
+$DomainFilterTypes = @(
+    "Connection hostname",
+    "Hostname",
+    "HTTP host",
+    "SSL SNI",
+    "SNI",
+    "DNS query",
+    "URI"
+)
 
-$HmacSha1       = New-Object System.Security.Cryptography.HMACSHA1
-$HmacSha1.Key   = [Text.Encoding]::ASCII.GetBytes($PrivateToken)
-$SignatureBytes = $HmacSha1.ComputeHash([Text.Encoding]::ASCII.GetBytes($StringToSign))
-$Signature      = [BitConverter]::ToString($SignatureBytes).Replace("-", "").ToLower()
+$IpFilterTypes = @(
+    "Destination IP",
+    "Endpoint IP",
+    "Dest IP"
+)
 
-$Uri = "$DarktraceIP$Endpoint"
+Write-Host "Starting chunked extraction from $($ChunkStart.ToString('yyyy-MM-dd')) to $($FinalEnd.ToString('yyyy-MM-dd'))..." -ForegroundColor Cyan
 
-# 3. Execute Request via curl.exe
-# -k : Insecure (skips self-signed cert validation)
-# -s : Silent mode (hides progress bar)
-# -S : Show errors if it fails
-# -o : Write output directly to a file (avoids PowerShell console encoding/buffer issues)
-Write-Host "Fetching data from Darktrace using curl.exe..." -ForegroundColor Cyan
+while ($ChunkStart -lt $FinalEnd) {
+    $ChunkEnd = $ChunkStart.AddDays($ChunkDays)
+    if ($ChunkEnd -gt $FinalEnd) { $ChunkEnd = $FinalEnd }
 
-& curl.exe -k -s -S `
-    -H "DTAPI-Token: $PublicToken" `
-    -H "DTAPI-Date: $DateHeader" `
-    -H "DTAPI-Signature: $Signature" `
-    -H "Accept: application/json" `
-    "$Uri" -o $TempJsonFile
+    $StartTimeMs = [math]::Floor(($ChunkStart - $EpochStart).TotalMilliseconds)
+    $EndTimeMs   = [math]::Floor(($ChunkEnd - $EpochStart).TotalMilliseconds)
 
-# Verify curl.exe succeeded and the file exists
-if ($LASTEXITCODE -ne 0 -or -not (Test-Path $TempJsonFile)) {
-    Write-Error "curl.exe failed with exit code $LASTEXITCODE."
-    return
-}
+    # Build endpoint & signature for this 7-day window
+    $Endpoint   = "/modelbreaches?starttime=$StartTimeMs&endtime=$EndTimeMs"
+    $NowUtc     = (Get-Date).ToUniversalTime()
+    $DateHeader = $NowUtc.ToString("yyyyMMddTHHmmss")
 
-# 4. Read JSON and Transform to CSV in PowerShell
-Write-Host "Parsing JSON and generating CSV..." -ForegroundColor Cyan
+    $StringToSign = "$Endpoint`n$PublicToken`n$DateHeader"
 
-try {
-    $RawJson  = Get-Content -Path $TempJsonFile -Raw -Encoding UTF8
-    $Response = $RawJson | ConvertFrom-Json
+    $HmacSha1       = New-Object System.Security.Cryptography.HMACSHA1
+    $HmacSha1.Key   = [Text.Encoding]::ASCII.GetBytes($PrivateToken)
+    $SignatureBytes = $HmacSha1.ComputeHash([Text.Encoding]::ASCII.GetBytes($StringToSign))
+    $Signature      = [BitConverter]::ToString($SignatureBytes).Replace("-", "").ToLower()
 
-    $CsvData = foreach ($Breach in $Response) {
-        $BreachTimeUtc = $EpochStart.AddMilliseconds($Breach.time).ToString("yyyy-MM-dd HH:mm:ss")
+    $Uri = "$DarktraceIP$Endpoint"
 
-        $ModelName = if ($Breach.model.then.name) { $Breach.model.then.name } else { $Breach.model.name }
-        $ModelPid  = if ($Breach.model.then.pid)  { $Breach.model.then.pid }  else { $Breach.model.pid }
+    Write-Host "Fetching window: $($ChunkStart.ToString('yyyy-MM-dd')) -> $($ChunkEnd.ToString('yyyy-MM-dd')) ... " -NoNewline
 
-        [PSCustomObject]@{
-            BreachID     = $Breach.pbid
-            TimeUTC      = $BreachTimeUtc
-            ModelName    = $ModelName
-            ModelID      = $ModelPid
-            ScorePercent = [math]::Round(($Breach.score * 100), 1)
-            DeviceID     = $Breach.device.did
-            Hostname     = $Breach.device.hostname
-            IPAddress    = $Breach.device.ip
-            MACAddress   = $Breach.device.macaddress
-            DeviceLabel  = $Breach.device.typelabel
-            CommentCount = $Breach.commentCount
-        }
+    if (Test-Path $TempJsonFile) { Remove-Item $TempJsonFile -Force }
+
+    & curl.exe -k -s -S --connect-timeout 15 --max-time 120 `
+        -H "DTAPI-Token: $PublicToken" `
+        -H "DTAPI-Date: $DateHeader" `
+        -H "DTAPI-Signature: $Signature" `
+        -H "Accept: application/json" `
+        "$Uri" -o $TempJsonFile
+
+    if ($LASTEXITCODE -ne 0 -or -not (Test-Path $TempJsonFile)) {
+        Write-Host "FAILED (curl exit code $LASTEXITCODE)" -ForegroundColor Red
+        break
     }
 
-    $CsvData | Sort-Object TimeUTC -Descending | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
-    Write-Host "Successfully exported $($CsvData.Count) breaches to $OutputFile" -ForegroundColor Green
+    $RawJson = Get-Content -Path $TempJsonFile -Raw -Encoding UTF8
 
-    # Clean up temporary JSON file
-    Remove-Item -Path $TempJsonFile -Force -ErrorAction SilentlyContinue
+    if ($RawJson -notmatch '^\s*\[') {
+        Write-Host "API ERROR!" -ForegroundColor Red
+        Write-Error "Unexpected response from Darktrace: $RawJson"
+        break
+    }
+
+    $ParsedChunk = $JsonSerializer.DeserializeObject($RawJson)
+    Write-Host "Retrieved $($ParsedChunk.Count) breaches." -ForegroundColor Green
+
+    foreach ($Breach in $ParsedChunk) {
+        $BreachTimeUtc = $EpochStart.AddMilliseconds([double]$Breach["time"]).ToString("yyyy-MM-dd HH:mm:ss")
+
+        # Safely extract Model and Source Device dictionaries
+        $ModelObj  = $Breach["model"]
+        $ModelThen = if ($ModelObj -and $ModelObj.ContainsKey("then")) { $ModelObj["then"] } else { $ModelObj }
+        $DeviceObj = $Breach["device"]
+
+        # Collections to hold unique destination values per breach
+        $DestDomains = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+        $DestIPs     = New-Object System.Collections.Generic.HashSet[string]([System.StringComparer]::OrdinalIgnoreCase)
+
+        # Walk through triggeredComponents -> triggeredFilters
+        $TriggeredComps = $Breach["triggeredComponents"]
+        if ($TriggeredComps) {
+            foreach ($Comp in $TriggeredComps) {
+                $TriggeredFilters = $Comp["triggeredFilters"]
+                if ($TriggeredFilters) {
+                    foreach ($Filter in $TriggeredFilters) {
+                        $FilterType = [string]$Filter["filterType"]
+                        $TriggerObj = $Filter["trigger"]
+                        $TriggerVal = if ($TriggerObj -and $TriggerObj.ContainsKey("value")) { [string]$TriggerObj["value"] } else { $null }
+
+                        if (-not [string]::IsNullOrWhiteSpace($TriggerVal)) {
+                            # Check if filterType matches our domain/hostname filters or wildcard "*hostname*" / "*domain*" / "*SNI*"
+                            if ($DomainFilterTypes -contains $FilterType -or $FilterType -match "(?i)(hostname|domain|sni|http host|dns query)") {
+                                [void]$DestDomains.Add($TriggerVal)
+                            }
+                            # Check if filterType matches Destination IP filters
+                            elseif ($IpFilterTypes -contains $FilterType -or $FilterType -match "(?i)(destination ip|dest ip|endpoint ip)") {
+                                [void]$DestIPs.Add($TriggerVal)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        $AllBreaches.Add([PSCustomObject]@{
+            BreachID            = $Breach["pbid"]
+            TimeUTC             = $BreachTimeUtc
+            ModelName           = if ($ModelThen) { $ModelThen["name"] } else { $null }
+            ModelID             = if ($ModelThen) { $ModelThen["pid"] }  else { $null }
+            ScorePercent        = [math]::Round(([double]$Breach["score"] * 100), 1)
+            SourceDeviceID      = if ($DeviceObj) { $DeviceObj["did"] }       else { $null }
+            SourceHostname      = if ($DeviceObj) { $DeviceObj["hostname"] }  else { $null }
+            SourceIP            = if ($DeviceObj) { $DeviceObj["ip"] }        else { $null }
+            SourceMAC           = if ($DeviceObj) { $DeviceObj["macaddress"]} else { $null }
+            DestinationHostname = ($DestDomains -join "; ")
+            DestinationIP       = ($DestIPs -join "; ")
+            CommentCount        = $Breach["commentCount"]
+        })
+    }
+
+    # Advance to the next 7-day window
+    $ChunkStart = $ChunkEnd.AddMilliseconds(1)
 }
-catch {
-    Write-Error "Failed to parse JSON response. Check $TempJsonFile to see if the API returned an HTML/text error message. Details: $($_.Exception.Message)"
+
+if ($AllBreaches.Count -gt 0) {
+    $AllBreaches | Sort-Object TimeUTC -Descending | Export-Csv -Path $OutputFile -NoTypeInformation -Encoding UTF8
+    Write-Host "`nDone! Exported $($AllBreaches.Count) total breaches to $OutputFile" -ForegroundColor Green
 }
+
+if (Test-Path $TempJsonFile) { Remove-Item $TempJsonFile -Force -ErrorAction SilentlyContinue }
